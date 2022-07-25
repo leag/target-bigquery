@@ -3,12 +3,14 @@ import codecs
 import csv
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from io import BytesIO
+from textwrap import dedent
 from typing import Dict, List, Optional
 
 import orjson
 import smart_open
 from google.cloud import _http, bigquery, bigquery_storage_v1, storage
-from google.cloud.bigquery_storage_v1 import types, writer, exceptions
+from google.cloud.bigquery.table import TimePartitioning, TimePartitioningType
+from google.cloud.bigquery_storage_v1 import types, writer
 from google.protobuf import descriptor_pb2
 from memoization import cached
 from singer_sdk import PluginBase
@@ -60,22 +62,52 @@ SCHEMA = [
 
 
 @cached
-def get_bq_client(credentials_path: str) -> bigquery.Client:
-    return bigquery.Client.from_service_account_json(credentials_path)
+def get_bq_client(
+    credentials_path: Optional[str] = None,
+    credentials_json: Optional[str] = None,
+) -> bigquery.Client:
+    if not credentials_path and not credentials_json:
+        raise KeyError(
+            "Credentials not supplied. Required config of either credentials_path or credentials_json"
+        )
+    if credentials_path:
+        return bigquery.Client.from_service_account_json(credentials_path)
+    elif credentials_json:
+        return bigquery.Client.from_service_account_info(orjson.loads(credentials_json))
 
 
 @cached
-def get_gcs_client(credentials_path: str) -> storage.Client:
-    return storage.Client.from_service_account_json(credentials_path)
+def get_gcs_client(
+    credentials_path: Optional[str] = None,
+    credentials_json: Optional[str] = None,
+) -> storage.Client:
+    if not credentials_path and not credentials_json:
+        raise KeyError(
+            "Credentials not supplied. Required config of either credentials_path or credentials_json"
+        )
+    if credentials_path:
+        return storage.Client.from_service_account_json(credentials_path)
+    elif credentials_json:
+        return storage.Client.from_service_account_info(orjson.loads(credentials_json))
 
 
 @cached
 def get_storage_client(
-    credentials_path: str,
+    credentials_path: Optional[str] = None,
+    credentials_json: Optional[str] = None,
 ) -> bigquery_storage_v1.BigQueryWriteClient:
-    return bigquery_storage_v1.BigQueryWriteClient.from_service_account_file(
-        credentials_path
-    )
+    if not credentials_path and not credentials_json:
+        raise KeyError(
+            "Credentials not supplied. Required config of either credentials_path or credentials_json"
+        )
+    if credentials_path:
+        return bigquery_storage_v1.BigQueryWriteClient.from_service_account_file(
+            credentials_path
+        )
+    elif credentials_json:
+        return bigquery_storage_v1.BigQueryWriteClient.from_service_account_info(
+            orjson.loads(credentials_json)
+        )
 
 
 def create_row_data(
@@ -89,10 +121,12 @@ def create_row_data(
 ):
     row = record_pb2.Record()
     row.data = data
-    row._sdc_extracted_at = _sdc_extracted_at
     row._sdc_received_at = _sdc_received_at
     row._sdc_batched_at = _sdc_batched_at
     row._sdc_sequence = _sdc_sequence
+    # These are not guaranteed in sdc
+    if _sdc_extracted_at:
+        row._sdc_extracted_at = _sdc_extracted_at
     if _sdc_deleted_at:
         row._sdc_deleted_at = _sdc_deleted_at
     if _sdc_table_version:
@@ -118,7 +152,9 @@ class BaseBigQuerySink(BatchSink):
         key_properties: Optional[List[str]],
     ) -> None:
         super().__init__(target, stream_name, schema, key_properties)
-        self._client = get_bq_client(self.config["credentials_path"])
+        self._client = get_bq_client(
+            self.config.get("credentials_path"), self.config.get("credentials_json")
+        )
         self._table = f"{self.config['project']}.{self.config['dataset']}.{self.stream_name.lower()}"
         self.jobs_running = []
         self.executor = ThreadPoolExecutor()
@@ -141,17 +177,32 @@ class BaseBigQuerySink(BatchSink):
                 self.config["dataset"], exists_ok=True
             )
         if self._table_ref is None:
-            self._table_ref = self._client.create_table(
-                bigquery.Table(
-                    self._table,
-                    schema=SCHEMA,
-                ),
-                exists_ok=True,
+            table = bigquery.Table(
+                self._table,
+                schema=SCHEMA,
             )
+            table.clustering_fields = [
+                "_sdc_extracted_at",
+                "_sdc_received_at",
+                "_sdc_batched_at",
+            ]
+            table.description = dedent(
+                f"""
+                This table is loaded via target-bigquery which is a 
+                Singer target that uses an unstructured load approach. 
+                The originating stream name is `{self.stream_name}`. 
+                This table is partitioned by _sdc_batched_at and 
+                clustered by related _sdc timestamp fields.
+            """
+            )
+            table.time_partitioning = TimePartitioning(
+                type_=TimePartitioningType.DAY, field="_sdc_batched_at"
+            )
+            self._table_ref = self._client.create_table(table, exists_ok=True)
 
     @property
     def max_size(self) -> int:
-        return self.config.get("batch_size_limit", 15000)
+        return self.config.get("batch_size", 10000)
 
     def _parse_timestamps_in_record(self, *args, **kwargs) -> None:
         pass
@@ -174,8 +225,10 @@ class BaseBigQuerySink(BatchSink):
         return {"data": orjson.dumps(record).decode("utf-8"), **metadata}
 
     def clean_up(self):
-        self.logger.info(f"Awaiting jobs: {len(self.jobs_running)}")
         wait(self.jobs_running)
+
+    def pre_state_hook(self) -> None:
+        pass
 
 
 class BigQueryStorageWriteSink(BaseBigQuerySink):
@@ -190,21 +243,30 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self._make_target()
         self._tracked_streams = []
         self._offset = 0
-        self._write_client = get_storage_client(self.config["credentials_path"])
+        self._write_client = get_storage_client(
+            self.config.get("credentials_path"), self.config.get("credentials_json")
+        )
         self._parent = self._write_client.table_path(
             self.config["project"],
             self.config["dataset"],
             self.stream_name.lower(),
         )
+        self.seed_new_append_stream()
+
+    def seed_new_append_stream(self):
         # Create write stream
         self.write_stream = types.WriteStream()
         self.write_stream.type_ = types.WriteStream.Type.PENDING
         self.write_stream = self._write_client.create_write_stream(
             parent=self._parent, write_stream=self.write_stream
         )
-        # Seed Schema
+        self.logger.info("Created write stream: %s", self.write_stream.name)
+        self._tracked_streams.append(self.write_stream.name)
+        # Create request template to seed writers
         self._request_template = types.AppendRowsRequest()
-        self._request_template.write_stream = self.write_stream.name
+        self._request_template.write_stream = (
+            self.write_stream.name
+        )  # <- updated when streams are created
         proto_schema = types.ProtoSchema()
         proto_descriptor = descriptor_pb2.DescriptorProto()
         record_pb2.Record.DESCRIPTOR.CopyToProto(proto_descriptor)
@@ -212,11 +274,11 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         proto_data = types.AppendRowsRequest.ProtoData()
         proto_data.writer_schema = proto_schema
         self._request_template.proto_rows = proto_data
-        # Writer seeded and ready
+        # Seed writer
         self.append_rows_stream = writer.AppendRowsStream(
             self._write_client, self._request_template
         )
-        self._tracked_streams.append(self.write_stream.name)
+        self._offset = self._total_records_written
 
     def start_batch(self, context: dict) -> None:
         self.proto_rows = types.ProtoRows()
@@ -230,42 +292,40 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         proto_data = types.AppendRowsRequest.ProtoData()
         proto_data.rows = self.proto_rows
         request.proto_rows = proto_data
+        if not self._tracked_streams:
+            self.seed_new_append_stream()
+            request.offset = self._total_records_written - self._offset
         try:
-            job = self.append_rows_stream.send(request)
-        except exceptions.StreamClosedError:
-            # Close existing stream & finalize
+            self.jobs_running.append(self.append_rows_stream.send(request))
+        except:
+            # Simplified self-healing
+            self._write_client.finalize_write_stream(name=self.write_stream.name)
+            self.seed_new_append_stream()
+            request.offset = self._total_records_written - self._offset
+            self.jobs_running.append(self.append_rows_stream.send(request))
+
+    def commit_streams(self):
+        if self.jobs_running:
+            self.jobs_running[-1].result()
             self.append_rows_stream.close()
             self._write_client.finalize_write_stream(name=self.write_stream.name)
-            # Recreate stream
-            self.write_stream = types.WriteStream()
-            self.write_stream.type_ = types.WriteStream.Type.PENDING
-            self.write_stream = self._write_client.create_write_stream(
-                parent=self._parent, write_stream=self.write_stream
+            batch_commit_write_streams_request = types.BatchCommitWriteStreamsRequest()
+            batch_commit_write_streams_request.parent = self._parent
+            batch_commit_write_streams_request.write_streams = self._tracked_streams
+            self._write_client.batch_commit_write_streams(
+                batch_commit_write_streams_request
             )
-            self._request_template.write_stream = self.write_stream.name
-            self.append_rows_stream = writer.AppendRowsStream(
-                self._write_client, self._request_template
+            self.logger.info(
+                f"Writes to streams: '{self._tracked_streams}' have been committed."
             )
-            # Retry
-            self._offset = self._total_records_written
-            request.offset = self._total_records_written - self._offset
-            job = self.append_rows_stream.send(request)
-            self._tracked_streams.append(self.write_stream.name)
-        self.jobs_running.append(job)
+            self.jobs_running = []
+            self._tracked_streams = []
 
     def clean_up(self):
-        self.jobs_running[-1].result()
-        self.append_rows_stream.close()
-        self._write_client.finalize_write_stream(name=self.write_stream.name)
-        batch_commit_write_streams_request = types.BatchCommitWriteStreamsRequest()
-        batch_commit_write_streams_request.parent = self._parent
-        batch_commit_write_streams_request.write_streams = self._tracked_streams
-        self._write_client.batch_commit_write_streams(
-            batch_commit_write_streams_request
-        )
-        self.logger.info(
-            f"Writes to streams: '{self._tracked_streams}' have been committed."
-        )
+        self.commit_streams()
+
+    def pre_state_hook(self):
+        self.commit_streams()
 
 
 class BigQueryGcsStagingSink(BaseBigQuerySink):
@@ -277,7 +337,9 @@ class BigQueryGcsStagingSink(BaseBigQuerySink):
         key_properties: Optional[List[str]],
     ) -> None:
         super().__init__(target, stream_name, schema, key_properties)
-        self._gcs_client = get_gcs_client(self.config["credentials_path"])
+        self._gcs_client = get_gcs_client(
+            self.config.get("credentials_path"), self.config.get("credentials_json")
+        )
         self._blob_path = "gs://{}/{}/{}/{}".format(
             self.config["bucket"],
             self.config.get("prefix_override", "target_bigquery"),

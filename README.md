@@ -22,17 +22,19 @@ pipx install target-bigquery
 
 ### Settings
 
+Note: Either credentials_path or credentials_json (str) must be provided.
+
 | Setting             | Required | Default | Description |
 |:--------------------|:--------:|:-------:|:------------|
-| credentials_path    | True     | None    | The path to a gcp credentials json file. |
+| credentials_path    | False    | None    | The path to a gcp credentials json file. |
+| credentials_json    | False    | None    | The str representation of gcp service account credentials. |
 | project             | True     | None    | The target GCP project to materialize data into. |
 | dataset             | True     | None    | The target dataset to materialize data into. |
-| add_record_metadata | False    |       1 | Inject record metadata into the schema. |
-| batch_size_limit    | False    |   10000 | The maximum number of rows to send in a single batch. |
+| batch_size          | False    |      50 | The maximum number of rows to send in a single batch. |
 | threads             | False    |       8 | The number of threads to use for writing to BigQuery. |
 | method              | False    | storage | The method to use for writing to BigQuery. Accepted values are: storage, batch, stream, gcs |
 | bucket              | False    | None    | The GCS bucket to use for staging data. Only used if method is gcs. |
-| gcs_buffer_size     | False    |     2.5 | The size of the buffer for GCS stream before flushing. Value in Megabytes. |
+| gcs_buffer_size     | False    |     2.5 | The size of the buffer for GCS stream before flushing. Value in megabytes. Only used if method is gcs. |
 | stream_maps         | False    | None    | Config object for stream maps capability. |
 | stream_map_config   | False    | None    | User-defined config values to be used within map expressions. |
 | flattening_enabled  | False    | None    | 'True' to enable schema flattening and automatically expand nested properties. |
@@ -59,6 +61,56 @@ https://cloud.google.com/bigquery/docs/authentication
 ## Usage
 
 You can easily run `target-bigquery` by itself or in a pipeline using [Meltano](https://meltano.com/).
+
+If you want to "flatten" the data without actually putting the time into staging models, which is reasonable in some but not all cases -- here are dbt macros to help!
+
+> This extracts keys from our ingest target. This is executed by `dbt.run_query` as seen in the next example.
+```sql
+{% macro get_keys_sql(relation, size=100, order_by="_sdc_batched_at desc") %}
+create temp function
+    json_keys(input STRING)
+returns
+    array<string>
+language
+    js as
+"""
+    return Object.keys(JSON.parse(input));
+""";
+with
+source__sampled as (
+    select    data
+    from      {{ relation }}
+    order by  {{ order_by }}
+    limit     {{ size }}
+)
+select distinct
+    keys
+from
+    source__sampled,
+    unnest(json_keys(to_json_string(data))) keys
+{% endmacro %}
+```
+
+> This is equivalent to dbt_utils.star for our `data` JSON column
+```sql
+{% macro json_star(relation, prefix='', suffix='', alias_funcs=[], space=2) -%}
+    -- 1. Verify Execute Mode
+    {%- if not execute -%}{{ return('*') }}{% endif %}
+    -- 2. Get Keys (notice our custom from above)
+    {% set keys = dbt.run_query(get_keys_sql(relation)).columns[0] | list %}
+    -- 3. Flatten `data`
+    {%- for key in keys %}
+        json_value(data.{{ key | trim }}) as
+            {{- ' ' ~ adapter.quote(prefix ~ key ~ suffix) | trim | lower }}
+        {%- if not loop.last %},{{ '\n' + (' ' * space) }}{% endif %}
+    {%- endfor -%}
+{%- endmacro %}
+```
+
+Usage (in a base model for example):
+
+`select {{ json_star( source("schema", "table") ) }} from {{ source("schema", "table") }}`
+
 
 ### Executing the Target Directly
 
